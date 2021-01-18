@@ -194,10 +194,10 @@ def main():
         df = pd.concat(frames)
 
         # dedup
+        dedup_time = time.time()
         if dedup_columns:
             print("deduplicate rows...")
-            dcolumns = [s for s in dedup_columns.split(',')]
-            dedup_time = time.time()
+            dcolumns = [s for s in dedup_columns.split(',')]            
             df.drop_duplicates(subset=dcolumns, inplace=True)
 
         # write to io buffer
