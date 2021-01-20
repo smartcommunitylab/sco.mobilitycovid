@@ -325,7 +325,7 @@ def main():
     if azure_oauth:
         # we can leverage abfss
         blob_in = f"abfss://{container_in}@{storage_account_name}.dfs.core.windows.net/stoplocation-v8_r70-s5-a70-h6/country={country}/year=2020/"
-    timezones_in = "cuebiq-data@mobilitacovid19.dfs.core.windows.net/utils_states_timezones/"
+    timezones_in = "abfss://cuebiq-data@mobilitacovid19.dfs.core.windows.net/utils_states_timezones/"
 
     path_out_distinct = f"distinct_user_clusters-v8_r70-s5-a70-h6_clustered_{roam_dist_stops}m/country={country}"
     path_out_all = f"all_user_clusters-v8_r70-s5-a70-h6_clustered_{roam_dist_stops}m/country={country}"
