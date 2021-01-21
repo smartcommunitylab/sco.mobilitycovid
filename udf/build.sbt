@@ -1,5 +1,5 @@
 name := "sco-mobilitycovid-udf"
-version := "0.1"
+version := "1.0"
 organization := "it.smartcommunitylab"
 scalaVersion := "2.11.12"
 val sparkVersion = "3.1.0"
