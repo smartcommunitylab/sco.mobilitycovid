@@ -1,13 +1,9 @@
 from __future__ import print_function
-from sklearn.neighbors import DistanceMetric
 from sklearn.cluster import DBSCAN
 
 import argparse
 import hashlib
-import numpy as np
 import os
-import pandas as pd
-import pygeohash as pgh
 import time
 
 from datetime import date, datetime, timedelta
@@ -103,7 +99,7 @@ def get_destinations(dfs, roam_dist=110, earth_radius=6372.795 * 1000):
             (pyspark DataFrame) If group_results=False: ['id_client', 'latitude', 'longitude', 'clatitude', 'clongitude', 'from', 'to']
     """
 
-    @pandas_udf("userId string, state string, latitude double, longitude double, begin timestamp, end timestamp, clusterId integer, geohash6 string", PandasUDFType.GROUPED_MAP)
+    @pandas_udf("userId string, state string, latitude double, longitude double, begin timestamp, end timestamp, clusterId integer", PandasUDFType.GROUPED_MAP)
     def get_destinations(df):
         """
         Applies DBSCAN to stop locations
@@ -117,8 +113,6 @@ def get_destinations(dfs, roam_dist=110, earth_radius=6372.795 * 1000):
         db = DBSCAN(eps=roam_dist/earth_radius, min_samples=1,
                     algorithm='ball_tree', metric='haversine')
         df["clusterId"] = db.fit_predict(df[['latitude', 'longitude']])
-        df['geohash6'] = df.apply(lambda x: pgh.encode(
-            degrees(x.latitude), degrees(x.longitude), precision=6), axis=1)
 
         return df
 
@@ -126,6 +120,9 @@ def get_destinations(dfs, roam_dist=110, earth_radius=6372.795 * 1000):
     dfs = dfs.withColumn('longitude', F.radians('longitude'))
 
     stops_dfs = dfs.groupby('userId', 'state').apply(get_destinations)
+
+    stops_dfs = stops_dfs.withColumn('latitude', F.degrees('latitude'))
+    stops_dfs = stops_dfs.withColumn('longitude', F.degrees('longitude'))
 
     w = Window().partitionBy('userId', 'clusterId')
 
@@ -328,6 +325,7 @@ def main():
     if azure_oauth:
         # we can leverage abfss
         blob_in = f"abfss://{container_in}@{storage_account_name}.dfs.core.windows.net/stoplocation-v8_r70-s5-a70-h6/country={country}/year=2020/"
+    timezones_in = "abfss://cuebiq-data@mobilitacovid19.dfs.core.windows.net/utils_states_timezones/"
 
     path_out_distinct = f"distinct_user_clusters-v8_r70-s5-a70-h6_clustered_{roam_dist_stops}m/country={country}"
     path_out_all = f"all_user_clusters-v8_r70-s5-a70-h6_clustered_{roam_dist_stops}m/country={country}"
@@ -366,6 +364,7 @@ def main():
     read_time = time.time()
 
     dfs = spark.read.format("parquet").load(blob_in)
+    dfs_timezones = spark.read.format("parquet").load(timezones_in)
 
     # apply partition filter
     dfs_state = dfs.where(f"state = '{state}'")
@@ -384,8 +383,8 @@ def main():
                                                    (col('prev_travelled_distance') > 0) |
                                                    (col('lag_next_travelled_distance') > 0) |
                                                    (col('distance_prev') > roam_dist_events) |
-                                                   ((F.dayofyear(col('begin')) > F.dayofyear(
-                                                       col('lag_end'))) & (F.hour(col('begin')) < 6))
+                                                   ((F.dayofyear(col('begin')) - F.dayofyear(col('lag_end')) == 1) &
+                                                    (F.hour(col('begin')) < 6))
                                                    ) &
                                                   ((col('lag_end').isNull()) | (col('lag_end') < col('begin'))), 1).otherwise(0))
     # Remove prev_travelled distance when rn == 0 (it happens when lag_end and begin overlap)
@@ -412,20 +411,31 @@ def main():
     dfs_destinations = dfs_destinations.withColumn('year', F.year('begin'))
     # dfs_destinations = dfs_destinations.withColumn('state', F.lit(state))
 
+    # Local time
+    dfs_destinations.createOrReplaceTempView("dfs_destinations")
+    dfs_destinations = spark.sql("""
+      SELECT dfs_destinations_distinct.*, geohash(clusterLatitude, clusterLongitude, 7) as geohash7
+      from dfs_destinations
+      """)
+    dfs_destinations = dfs_destinations.withColumn('geohash5', F.substring(col('geohash7'), 1, 5))
+    dfs_destinations = dfs_destinations.join(F.broadcast(dfs_timezones), on='geohash5').drop('geohash5')
+    dfs_destinations = dfs_destinations.withColumn('local_begin', F.from_utc_timestamp(col('begin'), col('tzid')))
+    dfs_destinations = dfs_destinations.withColumn('offset', (
+                (col('local_begin').cast('long') - col('begin').cast('long')) / 3600).cast('int')).drop('local_begin')
     dfs_destinations.persist(StorageLevel.DISK_ONLY)
 
     # Write
-    local_dir_distinct = local_dir+"/distinct/"
-    dfs_destinations_distinct = dfs_destinations.select(
-        'prefix', 'userId', 'clusterId', 'clusterLatitude', 'clusterLongitude', 'geohash6', 'year').distinct()
-    dfs_destinations_distinct.repartition(256, "prefix", "year").write.partitionBy(
-        "prefix", "year").format('parquet').mode('overwrite').save(local_dir_distinct)
-
-    local_dir_all = local_dir+"/all/"
+    local_dir_all = local_dir + "/all/"
     dfs_destinations_all = dfs_destinations.select(
-        'prefix', 'userId', 'clusterId', 'begin', 'end', 'year', 'dayofyear')
+        'prefix', 'userId', 'clusterId', 'begin', 'end', 'offset', 'year', 'dayofyear')
     dfs_destinations_all.repartition(256, "prefix", "year", "dayofyear").write.partitionBy(
         "prefix", "year", "dayofyear").format('parquet').mode('overwrite').save(local_dir_all)
+
+    local_dir_distinct = local_dir+"/distinct/"
+    dfs_destinations_distinct = dfs_destinations.select(
+        'prefix', 'userId', 'clusterId', 'clusterLatitude', 'clusterLongitude', 'geohash7', 'year').distinct()
+    dfs_destinations_distinct.repartition(256, "prefix", "year").write.partitionBy(
+        "prefix", "year").format('parquet').mode('overwrite').save(local_dir_distinct)
 
     dfs_destinations.unpersist()
 
